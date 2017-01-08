@@ -406,6 +406,7 @@ class MPDInterface(object):
             self._dummy_mode = True
 
     def _mpc(self, cmd):
+        cmd = list(cmd)
         cmd.insert(0, self._bin)
         cmd_str = " ".join(cmd)
         if self._dummy_mode:
@@ -428,10 +429,10 @@ class MPDInterface(object):
     def stop(self):
         return self._mpc_call("stop")
 
-    def forward(self):
+    def next(self):
         return self._mpc_call("next")
 
-    def reverse(self):
+    def prev(self):
         return self._mpc_call("prev")
 
 
@@ -453,7 +454,7 @@ class IRApp(object):
         self._scan_tfd = TimerFD()
         self._poll.add(self._scan_tfd, self._scan_callback,
                        PollService.READER_EMASK)
-        self._scan_tfd.set_rtime(20, repeated=True) # 20 seconds
+        self._enable_scan()
         # debounce timerfd (IR)
         self._last_ir = "" # unlocked
         self._debounce_tfd = TimerFD()
@@ -461,6 +462,10 @@ class IRApp(object):
                        PollService.READER_EMASK)
         # start operation
         self._connect()
+
+    def _enable_scan(self):
+        logging.info("Enable scanning ...")
+        self._scan_tfd.set_rtime(5, repeated=True) # scan all 5 seconds for ttyIRUSB
 
     def _unlock_last_ir_cb(self, pobj, fd, obj, event):
         logging.debug("Event %d on fd=%d" % (event, fd))
@@ -477,8 +482,14 @@ class IRApp(object):
         logging.debug("Trying to connect")
         try:
             self._watch.open()
+            self._scan_tfd.disarm()
         except Exception as e:
             logging.error("Connecting failed: %s" % str(e))
+
+    def _disconnect(self):
+        "Event to indicate that IRWatch has been disconnected"
+        logging.debug("Disconnect IRWatch")
+        self._enable_scan()
 
     def _ir_code_cb(self, ir_code):
         IR_PLAY = "a659758a"
@@ -497,22 +508,18 @@ class IRApp(object):
                                      repeated=False)
         if ir_code == IR_PLAY:
             logging.info("Play / Pause ({0})".format(ir_code))
-            mpd.togglePlay()
+            self._mpd.togglePlay()
         elif ir_code == IR_STOP:
             logging.info("Stop ({0})".format(ir_code))
-            mpd.stop()
+            self._mpd.stop()
         elif ir_code == IR_NEXT:
             logging.info("Next >>| ({0})".format(ir_code))
-            mpd.next()
+            self._mpd.next()
         elif ir_code == IR_PREV:
             logging.info("Previous |<< ({0})".format(ir_code))
-            mpd.prev()
+            self._mpd.prev()
         elif ir_code != "":
             logging.debug("Unimplemented IR code: {0}".format(ir_code))
-
-    def _disconnect(self):
-        "Event to indicate that IRWatch has been disconnected"
-        logging.debug("Disconnect IRWatch")
 
     def _scan_callback(self, pobj, fd, obj, event):
         logging.debug("Event %d on fd=%d" % (event, fd))
