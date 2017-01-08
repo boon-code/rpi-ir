@@ -397,6 +397,43 @@ class IRWatchFD(TTYUnit):
             self._poll.remove(self)
         TTYUnit.close(self)
 
+class MPDInterface(object):
+    def __init__(self, path="/usr/bin/mpc"):
+        self._bin = path
+        self._dummy_mode = False
+        self._output = ""
+        if not os.path.exists(path):
+            self._dummy_mode = True
+
+    def _mpc(self, cmd):
+        cmd.insert(0, self._bin)
+        cmd_str = " ".join(cmd)
+        if self._dummy_mode:
+            logging.info("Dummy mode command: [{0}]".format(cmd_str))
+        else:
+            ret = 0
+            try:
+                self._output = subprocess.check_output(cmd)
+            except subprocess.CalledProcessError as e:
+                ret = e.returncode
+            logging.debug("Call: '{0}': ret={1}".format(cmd_str, ret))
+            return ret
+
+    def _mpc_call(self, *args):
+        return self._mpc(args)
+
+    def togglePlay(self):
+        return self._mpc_call("toggle")
+
+    def stop(self):
+        return self._mpc_call("stop")
+
+    def forward(self):
+        return self._mpc_call("next")
+
+    def reverse(self):
+        return self._mpc_call("prev")
+
 
 class IRApp(object):
     _DEBOUNCE_NS = 400000000
@@ -405,6 +442,7 @@ class IRApp(object):
         self._dev_path = path
         self._exit_cmd = ""
         self._poll = PollService()
+        self._mpd = MPDInterface()
         self._watch = IRWatchFD(self._poll, path)
         self._watch.set_close_cb(self._disconnect)
         self._watch.set_event_cb(self._ir_code_cb)
@@ -444,9 +482,9 @@ class IRApp(object):
 
     def _ir_code_cb(self, ir_code):
         IR_PLAY = "a659758a"
-        IR_FORWARD = "a659916e"
+        IR_NEXT = "a659916e"
         IR_STOP = "a659906f"
-        IR_REVERSE = "a659926d"
+        IR_PREV = "a659926d"
 
         logging.debug("IR callback: {0}".format(ir_code))
 
@@ -459,12 +497,16 @@ class IRApp(object):
                                      repeated=False)
         if ir_code == IR_PLAY:
             logging.info("Play / Pause ({0})".format(ir_code))
+            mpd.togglePlay()
         elif ir_code == IR_STOP:
             logging.info("Stop ({0})".format(ir_code))
-        elif ir_code == IR_FORWARD:
-            logging.info("Forward >>| ({0})".format(ir_code))
-        elif ir_code == IR_REVERSE:
-            logging.info("Reverse |<< ({0})".format(ir_code))
+            mpd.stop()
+        elif ir_code == IR_NEXT:
+            logging.info("Next >>| ({0})".format(ir_code))
+            mpd.next()
+        elif ir_code == IR_PREV:
+            logging.info("Previous |<< ({0})".format(ir_code))
+            mpd.prev()
         elif ir_code != "":
             logging.debug("Unimplemented IR code: {0}".format(ir_code))
 
