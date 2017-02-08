@@ -447,9 +447,9 @@ class IRApp(object):
         self._watch = IRWatchFD(self._poll, path)
         self._watch.set_close_cb(self._disconnect)
         self._watch.set_event_cb(self._ir_code_cb)
-#        stream_to_nonblocking(sys.stdin)
-#        self._poll.add(sys.stdin, self._poll_callback,
-#                       PollService.READER_EMASK)
+        stream_to_nonblocking(sys.stdin)
+        self._poll.add(sys.stdin, self._stdin_callback,
+                       PollService.READER_EMASK)
         # scan timerfd
         self._scan_tfd = TimerFD()
         self._poll.add(self._scan_tfd, self._scan_callback,
@@ -533,70 +533,37 @@ class IRApp(object):
         if event & select.EPOLLHUP:
             logging.debug("HUP on fd=%d" % fd)
 
-    def _poll_callback(self, pobj, fd, obj, event):
+    def _stdin_callback(self, pobj, fd, obj, event):
         logging.debug("Event %d on fd=%d" % (event, fd))
         if event & select.EPOLLIN:
             data = obj.read(100).strip("\n")
             logging.debug("Data fd=%d: %s" % (fd, data))
-            self._exit_cmd = ""
-            m_goodn = self.RE_GOODN.match(data)
             if data == "close":
-                logging.debug("Found close command!")
                 self._poll.exit_loop()
             elif data == "connect":
                 logging.debug("Try to connect to arduino board")
                 self._connect()
-            elif data == "wdog":
-                logging.debug("Reset watchdog")
-                self._watch.write("r")
-            elif data == "info":
-                logging.debug("Info request")
-                self._watch.write("i")
-            elif data == "shutdown":
-                logging.debug("Shutdown rpi")
-                self._watch.write("s")
-                self._exit_cmd = "shutdown"
-            elif data == "config_slow":
-                logging.debug("Config shutdown to 10 Minutes")
-                self._watch.write("c75\n")
-            elif data == "config_fast":
-                logging.debug("Config shutdown to 16 Seconds")
-                self._watch.write("c1\n")
-            elif data == "bootloader":
-                logging.debug("Enter bootloader")
-                self._watch.write("b")
-            elif data == "btrigger":
-                self._watch.write("t")
-            elif data == "nimmer-pwr":
-                logging.debug("Assert Nimmer PWR Button")
-                self._watch.write("n")
-            elif data == "nimmer-kill":
-                logging.debug("Kill nimmer (force shutdown)")
-                self._watch.write("k")
-            elif data == 'nimmer':
-                logging.debug("Nimmer status request")
-                self._watch.write("p")
-            elif data == 'led':
-                logging.debug("Toggle nimmer LED status")
-                self._watch.write("l")
-            elif data == 'toggle-wdog':
-                logging.debug("Toggle wdog (enabled/disabled)")
-                self._watch.write("d")
-            elif data == 'echo':
-                logging.debug("Echo Request")
-                self._watch.write("e")
+            elif data in ("t", "toggle"):
+                self._mpd.togglePlay()
+            elif data in ("s", "stop"):
+                self._mpd.stop()
+            elif data in ("n", "next"):
+                self._mpd.next()
+            elif data in ("p", "prev", "previous"):
+                self._mpd.prev()
+            elif data in ("loader", "bootloader"):
+                self._watch.write('b')
+            elif data.startswith('write'):
+                cmd = data[5:].strip(" ")
+                if len(cmd) > 0:
+                    logging.info("Send command: {0}".format(cmd))
+                    self._watch.write(cmd)
+                else:
+                    logging.debug("No command specified - ignoring")
             elif data == "help":
                 logging.debug("Command List: %s" %
-                              ['close', 'connect', 'info', 'shutdown',
-                               'config_slow', 'config_fast', 'bootloader',
-                               'help', 'good-night', 'btrigger', 'led',
-                               'nimmer', 'nimmer-pwr', 'nimmer-kill',
-                               'wdog', 'toggle-wdog', 'echo'])
-            elif m_goodn is not None:
-                hours = int(m_goodn.group(1))
-                logging.debug("Good Night for %d hours" % hours)
-                self._watch.write("c%d\ns" % (hours * 3600/8))
-                self._exit_cmd = "shutdown"
+                              ['close', 'connect', 'toggle', 'stop',
+                               'next', 'previous', 'bootloader'])
         if event & select.EPOLLERR:
             logging.debug("Error on fd=%d" % fd)
         if event & select.EPOLLHUP:
