@@ -3,11 +3,14 @@ import os
 import re
 import tty
 import time
+import json
 import fcntl
 import socket
 import select
 import errno
 import struct
+import requests
+import traceback
 import logging
 import threading
 import ctypes
@@ -436,6 +439,173 @@ class MPDInterface(object):
         return self._mpc_call("prev")
 
 
+class MusicBot(threading.Thread):
+    REQUIRED = ('NAME', 'TOKEN', 'PASSWORD', 'TIMEOUT', 'API_URL')
+    def __init__(self, config_file, users_file='users.json'):
+        threading.Thread.__init__(self)
+        self.daemon = True  # kill on exit
+        self._cfg = self._loadConfig(config_file)
+        self._users_file = users_file
+        self._loadUsers()
+        self._saveUsers()
+
+    def _request(self, method, obj, **kwargs):
+        url = self._cfg['API_URL'].format(**self._cfg)
+        try:
+            r = requests.post(url + method, json=obj, stream=True, **kwargs)
+            r = r.json()
+            if 'ok' not in r:
+                r['ok'] = False
+            return r
+        except Exception:
+            txt = traceback.format_exc()
+            logging.error("Failed to send request: {0}".format(txt))
+            return dict(ok=False)
+
+    def _loadUsers(self):
+        self._users = set()
+        try:
+            with open(self._users_file, 'r') as f:
+                self._users = set(json.load(f))
+            logging.debug("Load users: {0}".format(", ".join(self._users)))
+        except Exception as e:
+            txt = traceback.format_exc()
+            logging.error("Failed to load users: {0}".format(txt))
+
+    def _saveUsers(self):
+        try:
+            with open(self._users_file, 'w') as f:
+                json.dump(list(self._users), f)
+        except Exception as e:
+            txt = traceback.format_exc()
+            logging.error("Failed to load users: {0}".format(txt))
+
+    def _sendTextMessage(self, chat_id, text):
+        r = self._request( 'sendMessage'
+                         , dict( chat_id = chat_id
+                               , text = text
+                               )
+                         )
+        if r['ok']:
+            return True
+        else:
+            logging.warning("Failed to send text: {0}".format(r))
+            return False
+
+    def _sendAllTextMessage(self, text):
+        ret = True
+        for id in self._users:
+            r = self._sendTextMessage(id, text)
+            ret = (ret and r)
+        return ret
+
+    def _loadConfig(self, config_file):
+        data = {}
+        with open(config_file, 'r') as f:
+            cfg = json.load(f)
+        missing = set()
+        for i in cfg.keys():
+            if i not in self.REQUIRED:
+                missing.add(i)
+        if missing:
+            raise RuntimeError("Missing required fields: {0}".format(", ".join(missing)))
+        return cfg
+
+    def _processMessage(self, msg):
+        try:
+            if msg['text'].startswith("/"):
+                cmd = msg['text'].split(" ", 1)
+                if "@" in cmd[0]:
+                    _, bot = cmd[0].split("@", 1)
+                    if bot.lower() != self._cfg['NAME']:
+                        logging.debug("Ignore message to different bot: {0}".format(cmd))
+                        return
+                self._processCommand(msg, *cmd)
+        except KeyError as e:
+            logging.debug("Missing key: {0}".format(e))
+        except Exception:
+            txt = traceback.format_exc()
+            logging.error("Failed to process message: {0}".format(txt))
+
+    def _processCommand(self, msg, cmd, *param):
+        cid = msg['chat']['id']
+        registered = cid in self._users
+        unhandled = False
+        param = " ".join(param)
+        unpriv = { '/start'    : self._cmdStart
+                 , '/help'     : self._cmdHelp
+                 }
+        priv = { '/stop'  : self._cmdStop
+               , '/quiet' : self._cmdQuiet
+               }
+
+        if cmd in unpriv.keys():
+            unpriv[cmd](cid, param, msg)
+        elif cmd in priv.keys():
+            if registered:
+                priv[cmd](cid, param, msg)
+            else:
+                self._sendTextMessage(cid, "Sign in using /start <password>")
+        else:
+            self._sendTextMessage(cid, "Unkown command: {0}".format(cmd))
+
+    def _cmdStart(self, cid, param, msg):
+        if param.strip() == self._cfg['PASSWORD']:
+            self._users.add(cid)
+            self._saveUsers()
+            self._sendTextMessage(cid, "You are signed in.")
+        else:
+            self._sendTextMessage(cid, "Invalid password")
+            self._sendAllTextMessage("Failed login attempt: cid={0}".format(cid))
+
+    def _cmdHelp(self, cid, param, msg):
+        help = """
+RPI Music Bot
+
+/help         - This help text
+/start <pass> - Register to use this bot
+/stop         - Unregister
+/quiet        - Quite mode now, I want to sleep
+"""
+        self._sendTextMessage(cid, help)
+
+    def _cmdStop(self, cid, param, msg):
+        self._users.discard(cid)
+        self._sendTextMessage(cid, "Successfully unregistered")
+
+    def _cmdQuiet(self, cid, param, msg):
+        logging.debug("Quiet: {0}".format(msg))
+        self._sendAllTextMessage("Quiet now!")
+
+    def run(self, *args, **kwargs):
+        last_update_id = 0
+
+        self._sendAllTextMessage("Welcome")
+        timeout = self._cfg['TIMEOUT']
+
+        while True:
+            try:
+                r = self._request('getUpdates'
+                                 , dict( offset = last_update_id + 1
+                                       , timeout = timeout
+                                       )
+                                 , timeout = timeout + 5
+                                 )
+
+                if r['ok']:
+                    for i in r['result']:
+                        if i['update_id'] > last_update_id:
+                            last_update_id = i['update_id']
+                        self._processMessage(i['message'])
+            except Exception:
+                txt = traceback.format_exc()
+                logging.error("Failed to fetch updates: {0}".format(txt))
+
+    def exit(self):
+        # TODO: Implement proper handling (interrupt request)
+        logging.info("Music Bot is terminated")
+
+
 class IRApp(object):
     _DEBOUNCE_NS = 400000000
 
@@ -583,9 +753,36 @@ class IRApp(object):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument( '--verbose'
+                       , dest = 'verbosity'
+                       , action = 'store_const'
+                       , const = logging.DEBUG
+                       )
+    parser.add_argument( '--quiet'
+                       , dest = 'verbosity'
+                       , action = 'store_const'
+                       , const = logging.ERROR
+                       )
+    parser.add_argument( '--bot-config'
+                       , dest = 'bot_cfg'
+                       , default = None
+                       )
+    args = parser.parse_args(args)
+
+    music_bot = None
+    if args.bot_cfg is not None:
+        try:
+            music_bot = MusicBot(args.bot_cfg)
+            music_bot.start()
+        except RuntimeError:
+            pass
     DEV='/dev/ttyIRUSB'
     dut = IRApp(DEV)
     dut.poll_main()
+    logging.info("Exit main")
+    if music_bot is not None:
+        music_bot.exit()
     logging.info("Exit program")
 
 if __name__ == '__main__':
