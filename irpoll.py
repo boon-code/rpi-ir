@@ -10,6 +10,7 @@ import select
 import errno
 import struct
 import requests
+import argparse
 import traceback
 import logging
 import threading
@@ -17,6 +18,11 @@ import ctypes
 import termios
 import optparse
 import subprocess
+
+try:
+    import queue
+except ImportError:
+    import Queue as queue
 
 termios.c_iflag = 0
 termios.c_oflag = 1
@@ -152,6 +158,17 @@ class EventFD(object):
         return self._fd
 
 
+def set_block_mode(fd, blocking):
+    flags = fcntl.fcntl(fd, fcntl.F_GETFL, 0)
+    old_flags = flags
+    if blocking:
+        flags &= ~os.O_NONBLOCK
+    else:
+        flags |= os.O_NONBLOCK
+    fcntl.fcntl(fd, fcntl.F_SETFL, flags)
+    return old_flags
+
+
 class PollEntry(object):
     def __init__(self, callback, event_mask, obj_or_fd):
         self.callback = callback
@@ -275,13 +292,7 @@ class TTYUnit(object):
         self._set_mode()
 
     def _set_block_mode(self, blocking):
-        flags = fcntl.fcntl(self._fd, fcntl.F_GETFL, 0)
-        self._old_flags = flags
-        if blocking:
-            flags &= ~os.O_NONBLOCK
-        else:
-            flags |= os.O_NONBLOCK
-        fcntl.fcntl(self._fd, fcntl.F_SETFL, flags)
+        self._old_flags = set_block_mode(self._fd, blocking)
 
     def _restore_block_mode(self):
         fcntl.fcntl(self._fd, fcntl.F_SETFL, self._old_flags)
@@ -339,6 +350,7 @@ def stream_to_nonblocking(stream):
 
 class IRWatchFD(TTYUnit):
     RE_IR = re.compile(r'IR:\s+([0-9,a-f,A-F]+)#')
+    RE_VOL = re.compile(r'VOL:([0-9,a-f,A-F]+)#')
     def __init__(self, poll_obj, path):
         TTYUnit.__init__(self, path)
         self._wbuf = ""
@@ -384,7 +396,12 @@ class IRWatchFD(TTYUnit):
                 ir_code = ev.group(1)
                 logging.debug("Got IR = {0}".format(ir_code))
                 if self._event_cb is not None:
-                    self._event_cb(ir_code)
+                    self._event_cb("IR", ir_code)
+            for ev in self.RE_VOL.finditer(data):
+                vol = ev.group(1)
+                logging.debug("Found volume {0}".format(vol))
+                if self._event_cb is not None:
+                    self._event_cb("VOL", vol)
         if event & select.EPOLLOUT:
             self._actual_write()
         if event & select.EPOLLERR:
@@ -441,13 +458,14 @@ class MPDInterface(object):
 
 class MusicBot(threading.Thread):
     REQUIRED = ('NAME', 'TOKEN', 'PASSWORD', 'TIMEOUT', 'API_URL')
-    def __init__(self, config_file, users_file='users.json'):
+    def __init__(self, config_file, users_file='users.json', botif=None):
         threading.Thread.__init__(self)
         self.daemon = True  # kill on exit
         self._cfg = self._loadConfig(config_file)
         self._users_file = users_file
         self._loadUsers()
         self._saveUsers()
+        self._if = botif
 
     def _request(self, method, obj, **kwargs):
         url = self._cfg['API_URL'].format(**self._cfg)
@@ -466,7 +484,7 @@ class MusicBot(threading.Thread):
         self._users = set()
         try:
             with open(self._users_file, 'r') as f:
-                self._users = set(json.load(f))
+                self._users = set([ str(i) for i in json.load(f)])
             logging.debug("Load users: {0}".format(", ".join(self._users)))
         except Exception as e:
             txt = traceback.format_exc()
@@ -529,7 +547,7 @@ class MusicBot(threading.Thread):
 
     def _processCommand(self, msg, cmd, *param):
         cid = msg['chat']['id']
-        registered = cid in self._users
+        registered = str(cid) in self._users
         unhandled = False
         param = " ".join(param)
         unpriv = { '/start'    : self._cmdStart
@@ -537,6 +555,8 @@ class MusicBot(threading.Thread):
                  }
         priv = { '/stop'  : self._cmdStop
                , '/quiet' : self._cmdQuiet
+               , '/louder' : self._cmdLouder
+               , '/info'  : self._cmdInfo
                }
 
         if cmd in unpriv.keys():
@@ -551,7 +571,7 @@ class MusicBot(threading.Thread):
 
     def _cmdStart(self, cid, param, msg):
         if param.strip() == self._cfg['PASSWORD']:
-            self._users.add(cid)
+            self._users.add(str(cid))
             self._saveUsers()
             self._sendTextMessage(cid, "You are signed in.")
         else:
@@ -562,20 +582,52 @@ class MusicBot(threading.Thread):
         help = """
 RPI Music Bot
 
+/quiet        - Quite mode now, I want to sleep (-3dB)
 /help         - This help text
 /start <pass> - Register to use this bot
 /stop         - Unregister
-/quiet        - Quite mode now, I want to sleep
+/info         - Get current volume
+/louder       - Increase volume (+3dB)
 """
         self._sendTextMessage(cid, help)
 
     def _cmdStop(self, cid, param, msg):
-        self._users.discard(cid)
+        self._users.discard(str(cid))
         self._sendTextMessage(cid, "Successfully unregistered")
 
     def _cmdQuiet(self, cid, param, msg):
+        notify = "{0} requested silence; be nice..."
         logging.debug("Quiet: {0}".format(msg))
-        self._sendAllTextMessage("Quiet now!")
+        usr = ( msg['chat'].get('first_name', str(cid))
+              + " "
+              + msg['chat'].get('last_name', '')
+              ).strip(" ")
+        for i in self._users:
+            if str(cid) != i:
+                self._sendTextMessage( i
+                                     , notify.format(usr)
+                                     )
+        # TODO: Silence
+        if self._if is not None:
+            self._if.sendQuestion("quiet")
+            self._sendTextMessage(cid, "Is it better now?")
+
+    def _cmdLouder(self, cid, param, msg):
+        logging.debug("Increase volume +3dB")
+        usr = ( msg['chat'].get('first_name', str(cid))
+              + " "
+              + msg['chat'].get('last_name', '')
+              ).strip(" ")
+        if self._if is not None:
+            self._if.sendQuestion("louder")
+            self._sendAllTextMessage("{0} increased volume".format(usr))
+        else:
+            self._sendTextMessage(cid, "Interface unavailable... :(")
+
+    def _cmdInfo(self, cid, param, msg):
+        if self._if is not None:
+            repl = self._if.sendQuestion("volume-info")
+            self._sendTextMessage(cid, "Volume is {0}".format(repl))
 
     def run(self, *args, **kwargs):
         last_update_id = 0
@@ -606,6 +658,28 @@ RPI Music Bot
         logging.info("Music Bot is terminated")
 
 
+class IRBotPlugin(object):
+    def __init__(self):
+        self.fd = EventFD()
+        self._q = queue.Queue()
+        self._a = queue.Queue()
+
+    def sendQuestion(self, obj):  # to app
+        self._q.put(obj)
+        self.fd.notify()
+        return self._a.get(timeout=20)
+
+    def getQuestion(self):
+        self.fd.wait()
+        return self._q.get(timeout=20)
+
+    def sendReply(self, obj):
+        self._a.put(obj)
+
+    def fileno(self):
+        return self.fd.fileno()
+
+
 class IRApp(object):
     _DEBOUNCE_NS = 400000000
 
@@ -616,9 +690,13 @@ class IRApp(object):
         self._mpd = MPDInterface()
         self._watch = IRWatchFD(self._poll, path)
         self._watch.set_close_cb(self._disconnect)
-        self._watch.set_event_cb(self._ir_code_cb)
+        self._watch.set_event_cb(self._watch_callback)
         stream_to_nonblocking(sys.stdin)
         self._poll.add(sys.stdin, self._stdin_callback,
+                       PollService.READER_EMASK)
+        # Bot
+        self.botif = IRBotPlugin()
+        self._poll.add(self.botif, self._bot_callback,
                        PollService.READER_EMASK)
         # scan timerfd
         self._scan_tfd = TimerFD()
@@ -661,6 +739,13 @@ class IRApp(object):
         logging.debug("Disconnect IRWatch")
         self._enable_scan()
 
+    def _watch_callback(self, t, ev):
+        if t == "IR":
+            self._ir_code_cb(ev)
+        elif t == "VOL":
+            if self.botif is not None:
+                self.botif.sendReply(ev)
+
     def _ir_code_cb(self, ir_code):
         IR_PLAY = "a659758a"
         IR_NEXT = "a659916e"
@@ -702,6 +787,39 @@ class IRApp(object):
             logging.debug("Error on fd=%d" % fd)
         if event & select.EPOLLHUP:
             logging.debug("HUP on fd=%d" % fd)
+
+    def _bot_callback(self, pobj, fd, obj, event):
+        logging.debug("Event %d on fd=%d" % (event, fd))
+        if event & select.EPOLLIN:
+            data = obj.getQuestion()
+            logging.debug("Received {0}".format(data))
+            if data in ("t", "toggle"):
+                self._mpd.togglePlay()
+                obj.sendReply("OK")
+            elif data in ("s", "stop"):
+                self._mpd.stop()
+                obj.sendReply("OK")
+            elif data in ("n", "next"):
+                self._mpd.next()
+                obj.sendReply("OK")
+            elif data in ("p", "prev", "previous"):
+                self._mpd.prev()
+                obj.sendReply("OK")
+            elif data in ("q", "quiet", "quiet-mode"):
+                self._watch.write("Q")
+                obj.sendReply("OK")
+            elif data in ("unlock",):
+                self._watch.write("U")
+                obj.sendReply("OK")
+            elif data in ("info",):
+                self._watch.write("i")
+            elif data in ("volume", "volume-info"):
+                self._watch.write("I")
+            elif data in ("louder", "L"):
+                self._watch.write("L")
+                obj.sendReply("OK")
+            else:
+                obj.sendReply("Failed")
 
     def _stdin_callback(self, pobj, fd, obj, event):
         logging.debug("Event %d on fd=%d" % (event, fd))
@@ -768,17 +886,17 @@ def main():
                        , dest = 'bot_cfg'
                        , default = None
                        )
-    args = parser.parse_args(args)
+    args = parser.parse_args()
 
     music_bot = None
+    DEV='/dev/ttyIRUSB'
+    dut = IRApp(DEV)
     if args.bot_cfg is not None:
         try:
-            music_bot = MusicBot(args.bot_cfg)
+            music_bot = MusicBot(args.bot_cfg, botif=dut.botif)
             music_bot.start()
         except RuntimeError:
             pass
-    DEV='/dev/ttyIRUSB'
-    dut = IRApp(DEV)
     dut.poll_main()
     logging.info("Exit main")
     if music_bot is not None:
