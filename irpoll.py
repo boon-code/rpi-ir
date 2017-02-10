@@ -14,6 +14,7 @@ import argparse
 import traceback
 import logging
 import threading
+import traceback
 import ctypes
 import termios
 import optparse
@@ -418,10 +419,10 @@ class IRWatchFD(TTYUnit):
         TTYUnit.close(self)
 
 class MPDInterface(object):
+    RE_STAT = re.compile(r'^[[](paused|playing)[]]', re.MULTILINE)
     def __init__(self, path="/usr/bin/mpc"):
         self._bin = path
         self._dummy_mode = False
-        self._output = ""
         if not os.path.exists(path):
             self._dummy_mode = True
 
@@ -431,34 +432,84 @@ class MPDInterface(object):
         cmd_str = " ".join(cmd)
         if self._dummy_mode:
             logging.info("Dummy mode command: [{0}]".format(cmd_str))
+            return ret, ''
         else:
             ret = 0
+            output = ""
             try:
-                self._output = subprocess.check_output(cmd)
+                output = subprocess.check_output(cmd)
             except subprocess.CalledProcessError as e:
                 ret = e.returncode
             logging.debug("Call: '{0}': ret={1}".format(cmd_str, ret))
-            return ret
+            return ret, output
+
+    def _mpc_status(self):
+        ret, out = self._mpc_call("status", '--format=""')
+        if ret == 0:
+            m = self.RE_STAT.search(out)
+            if m is None:
+                return 'stopped'
+            else:
+                return m.group(1)
+        else:
+            return 'unkown'
 
     def _mpc_call(self, *args):
         return self._mpc(args)
 
+    def currentSong(self):
+        ret, out = self._mpc_call("current")
+        if (ret == 0) and (out != ''):
+            return True, out
+        else:
+            return False, ''
+
+    def play(self):
+        status = self._mpc_status()
+        if status == 'playing':
+            return 0
+        if status in ('unkown', 'stopped'):
+            self.stop()
+        return self.togglePlay()
+
+    def pause(self):
+        status = self._mpc_status()
+        if status == 'playing':
+            return self.togglePlay()
+        else:
+            return 0
+
     def togglePlay(self):
-        return self._mpc_call("toggle")
+        return self._mpc_call("toggle")[0]
 
     def stop(self):
-        return self._mpc_call("stop")
+        return self._mpc_call("stop")[0]
 
     def next(self):
-        return self._mpc_call("next")
+        return self._mpc_call("next")[0]
 
     def prev(self):
-        return self._mpc_call("prev")
+        return self._mpc_call("prev")[0]
+
+
+def _bent(cmd, help, p=0, params=tuple()):
+    """ Construct Bot command entry
+
+    :param cmd:    Command to run
+    :param help:   Help text to display
+    :param p:      Priority for sorting; higher means output first on /help
+    :param params: Tuple of parameter names for the command (for display only)
+    """
+    return dict( cmd = cmd
+               , help = help
+               , priority = p
+               , parameter = params
+               )
 
 
 class MusicBot(threading.Thread):
     REQUIRED = ('NAME', 'TOKEN', 'PASSWORD', 'TIMEOUT', 'API_URL')
-    def __init__(self, config_file, users_file='users.json', botif=None):
+    def __init__(self, config_file, users_file='users.json', botif=None, welcome=True):
         threading.Thread.__init__(self)
         self.daemon = True  # kill on exit
         self._cfg = self._loadConfig(config_file)
@@ -466,6 +517,57 @@ class MusicBot(threading.Thread):
         self._loadUsers()
         self._saveUsers()
         self._if = botif
+        self._welcome = welcome
+        self._unpriv = \
+                { '/start' : _bent( self._cmdStart
+                                  , "Register to use this bot"
+                                  , params=('key',)
+                                  )
+                , '/help'  : _bent(self._cmdHelp, "This help text")
+                , '/cmd'   : _bent( self._cmdCommandList
+                                  , "Output command list (for @BotFather /setcommands)"
+                                  )
+                }
+        self._priv = \
+                { '/stop'  : _bent(self._cmdStop, "Unregister")
+                , '/quiet' : _bent( self._cmdQuiet
+                                  , "Quiet mode: Reduce volume by -3dB"
+                                  , p = 100
+                                  )
+                , '/louder' : _bent(self._cmdLouder, "Increase volume (+3dB)", p=5)
+                , '/info'  : _bent(self._cmdInfo, "Get current volume")
+                , '/next'  : _bent( lambda *a: self._mpcSimple(a[0], 'next')
+                                  , "Next song"
+                                  , p=5
+                                  )
+                , '/previous' : _bent( lambda *a: self._mpcSimple(a[0], 'previous')
+                                     , "Previous song"
+                                     , p=5
+                                     )
+                , '/play' : _bent( lambda *a: self._mpcSimple(a[0], 'play')
+                                 , "Start playback"
+                                 , p=5
+                                 )
+                , '/pause' : _bent( lambda *a: self._mpcSimple(a[0], 'pause')
+                                  , "Pause playback"
+                                  , p=6
+                                  )
+                , '/songname' : _bent(self._cmdGetSong, "Get current song", p=3)
+                }
+
+    def _all_cmds(self):
+        for k,v in self._unpriv.items():
+            yield (k,v)
+        for k,v in self._priv.items():
+            yield (k,v)
+
+    def _priv_call(self, cmd, *args):
+        d = self._priv[cmd]
+        return d['cmd'](*args)
+
+    def _unpriv_call(self, cmd, *args):
+        d = self._unpriv[cmd]
+        return d['cmd'](*args)
 
     def _request(self, method, obj, **kwargs):
         url = self._cfg['API_URL'].format(**self._cfg)
@@ -540,7 +642,8 @@ class MusicBot(threading.Thread):
                         return
                 self._processCommand(msg, *cmd)
         except KeyError as e:
-            logging.debug("Missing key: {0}".format(e))
+            tb = traceback.format_exc()
+            logging.debug("Missing key: {0}\n{1}".format(e, tb))
         except Exception:
             txt = traceback.format_exc()
             logging.error("Failed to process message: {0}".format(txt))
@@ -550,22 +653,14 @@ class MusicBot(threading.Thread):
         registered = str(cid) in self._users
         unhandled = False
         param = " ".join(param)
-        unpriv = { '/start'    : self._cmdStart
-                 , '/help'     : self._cmdHelp
-                 }
-        priv = { '/stop'  : self._cmdStop
-               , '/quiet' : self._cmdQuiet
-               , '/louder' : self._cmdLouder
-               , '/info'  : self._cmdInfo
-               }
 
-        if cmd in unpriv.keys():
-            unpriv[cmd](cid, param, msg)
-        elif cmd in priv.keys():
+        if cmd in self._unpriv.keys():
+            self._unpriv_call(cmd, cid, param, msg)
+        elif cmd in self._priv.keys():
             if registered:
-                priv[cmd](cid, param, msg)
+                self._priv_call(cmd, cid, param, msg)
             else:
-                self._sendTextMessage(cid, "Sign in using /start <password>")
+                self._sendTextMessage(cid, "Sign in using /start <key>")
         else:
             self._sendTextMessage(cid, "Unkown command: {0}".format(cmd))
 
@@ -578,18 +673,23 @@ class MusicBot(threading.Thread):
             self._sendTextMessage(cid, "Invalid password")
             self._sendAllTextMessage("Failed login attempt: cid={0}".format(cid))
 
-    def _cmdHelp(self, cid, param, msg):
-        help = """
-RPI Music Bot
+    def _sort_cmds(self, item):
+        return (-item[1]['priority'], item[0])
 
-/quiet        - Quite mode now, I want to sleep (-3dB)
-/help         - This help text
-/start <pass> - Register to use this bot
-/stop         - Unregister
-/info         - Get current volume
-/louder       - Increase volume (+3dB)
-"""
-        self._sendTextMessage(cid, help)
+    def _cmdHelp(self, cid, param, msg):
+        help = ["RPI Music Bot\n"]
+        max_len = max([len(i[0]) for i in self._all_cmds()])
+        for i in sorted(self._all_cmds(), key=self._sort_cmds):
+            help.append("{0:<{max}} - {1[help]}".format(*i, max=max_len))
+        self._sendTextMessage(cid, "\n".join(help))
+
+    def _cmdCommandList(self, cid, param, msg):
+        cmds = []
+        max_len = max([len(i[0]) for i in self._all_cmds()]) - 1  # no '/'
+        for i in sorted(self._all_cmds(), key=self._sort_cmds):
+            c = i[0][1:]
+            cmds.append("{cmd:<{max}} - {1[help]}".format(*i, max=max_len, cmd=c))
+        self._sendTextMessage(cid, "\n".join(cmds))
 
     def _cmdStop(self, cid, param, msg):
         self._users.discard(str(cid))
@@ -629,10 +729,25 @@ RPI Music Bot
             repl = self._if.sendQuestion("volume-info")
             self._sendTextMessage(cid, "Volume is {0}".format(repl))
 
+    def _mpcSimple(self, cid, mpc_cmd):
+        if self._if is not None:
+            repl = self._if.sendQuestion(mpc_cmd)
+            self._sendTextMessage(cid, repl)
+
+    def _cmdGetSong(self, cid, param, msg):
+        if self._if is not None:
+            repl = self._if.sendQuestion("getSong")
+            if repl == "":
+                self._sendTextMessage(cid, "No song is currently playing")
+            else:
+                t = "Current song: {}".format(repl)
+            self._sendTextMessage(cid, t)
+
     def run(self, *args, **kwargs):
         last_update_id = 0
 
-        self._sendAllTextMessage("Welcome")
+        if self._welcome:
+            self._sendAllTextMessage("Welcome")
         timeout = self._cfg['TIMEOUT']
 
         while True:
@@ -793,9 +908,24 @@ class IRApp(object):
         if event & select.EPOLLIN:
             data = obj.getQuestion()
             logging.debug("Received {0}".format(data))
+            if not self._watch.is_open():
+                obj.sendReply("Music volume control board is not connected/powered; Sorry :(")
+                return # exit
             if data in ("t", "toggle"):
                 self._mpd.togglePlay()
                 obj.sendReply("OK")
+            elif data == "play":
+                self._mpd.play()
+                obj.sendReply("OK")
+            elif data == "pause":
+                self._mpd.pause()
+                obj.sendReply("OK")
+            elif data == "getSong":
+                st, song = self._mpd.currentSong()
+                if st:
+                    obj.sendReply(song)
+                else:
+                    obj.sendReply("")
             elif data in ("s", "stop"):
                 self._mpd.stop()
                 obj.sendReply("OK")
@@ -831,6 +961,12 @@ class IRApp(object):
             elif data == "connect":
                 logging.debug("Try to connect to arduino board")
                 self._connect()
+            elif data == "play":
+                self._mpd.play()
+            elif data in ("current", "song", "current song", "now", "playing"):
+                st, song = self._mpd.currentSong()
+                if st:
+                    logging.info("Current song: {0}".format(song))
             elif data in ("t", "toggle"):
                 self._mpd.togglePlay()
             elif data in ("s", "stop"):
@@ -886,6 +1022,11 @@ def main():
                        , dest = 'bot_cfg'
                        , default = None
                        )
+    parser.add_argument( '--no-welcome'
+                       , dest = 'welcome'
+                       , default = True
+                       , action = "store_false"
+                       )
     args = parser.parse_args()
 
     music_bot = None
@@ -893,7 +1034,10 @@ def main():
     dut = IRApp(DEV)
     if args.bot_cfg is not None:
         try:
-            music_bot = MusicBot(args.bot_cfg, botif=dut.botif)
+            music_bot = MusicBot( args.bot_cfg
+                                , botif=dut.botif
+                                , welcome=args.welcome
+                                )
             music_bot.start()
         except RuntimeError:
             pass
