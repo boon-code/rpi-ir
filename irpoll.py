@@ -534,24 +534,28 @@ class MusicBot(threading.Thread):
                                   , "Quiet mode: Reduce volume by -3dB"
                                   , p = 100
                                   )
-                , '/louder' : _bent(self._cmdLouder, "Increase volume (+3dB)", p=5)
+                , '/louder' : _bent(self._cmdLouder, "Increase volume (+3dB)", p = 5)
                 , '/info'  : _bent(self._cmdInfo, "Get current volume")
                 , '/next'  : _bent( lambda *a: self._mpcSimple(a[0], 'next')
                                   , "Next song"
-                                  , p=5
+                                  , p = 5
                                   )
                 , '/previous' : _bent( lambda *a: self._mpcSimple(a[0], 'previous')
                                      , "Previous song"
-                                     , p=5
+                                     , p = 5
                                      )
                 , '/play' : _bent( lambda *a: self._mpcSimple(a[0], 'play')
                                  , "Start playback"
-                                 , p=5
+                                 , p = 5
                                  )
                 , '/pause' : _bent( lambda *a: self._mpcSimple(a[0], 'pause')
                                   , "Pause playback"
-                                  , p=6
+                                  , p = 6
                                   )
+                , '/off' : _bent( lambda *a: self._mpcSimple(a[0], 'stop')
+                                , "Stop playback and switch off"
+                                , p = 4
+                                )
                 , '/songname' : _bent(self._cmdGetSong, "Get current song", p=3)
                 }
 
@@ -727,7 +731,7 @@ class MusicBot(threading.Thread):
     def _cmdInfo(self, cid, param, msg):
         if self._if is not None:
             repl = self._if.sendQuestion("volume-info")
-            self._sendTextMessage(cid, "Volume is {0}".format(repl))
+            self._sendTextMessage(cid, repl)
 
     def _mpcSimple(self, cid, mpc_cmd):
         if self._if is not None:
@@ -854,12 +858,24 @@ class IRApp(object):
         logging.debug("Disconnect IRWatch")
         self._enable_scan()
 
+    def _set_power(self, on=False):
+        if self._watch.is_open():
+            if on:
+                logging.debug("Enable power relay")
+                self._watch.write('P')
+            else:
+                logging.debug("Disable power relay")
+                self._watch.write('p')
+        else:
+            logging.debug("Arduino not connected")
+
     def _watch_callback(self, t, ev):
         if t == "IR":
             self._ir_code_cb(ev)
         elif t == "VOL":
             if self.botif is not None:
-                self.botif.sendReply(ev)
+                txt = "Volume is {}".format(ev)
+                self.botif.sendReply(txt)
 
     def _ir_code_cb(self, ir_code):
         IR_PLAY = "a659758a"
@@ -879,9 +895,11 @@ class IRApp(object):
         if ir_code == IR_PLAY:
             logging.info("Play / Pause ({0})".format(ir_code))
             self._mpd.togglePlay()
+            self._set_power(on=True)
         elif ir_code == IR_STOP:
             logging.info("Stop ({0})".format(ir_code))
             self._mpd.stop()
+            self._set_power(on=False)
         elif ir_code == IR_NEXT:
             logging.info("Next >>| ({0})".format(ir_code))
             self._mpd.next()
@@ -908,14 +926,13 @@ class IRApp(object):
         if event & select.EPOLLIN:
             data = obj.getQuestion()
             logging.debug("Received {0}".format(data))
-            if not self._watch.is_open():
-                obj.sendReply("Music volume control board is not connected/powered; Sorry :(")
-                return # exit
             if data in ("t", "toggle"):
                 self._mpd.togglePlay()
+                self._set_power(on=True)
                 obj.sendReply("OK")
             elif data == "play":
                 self._mpd.play()
+                self._set_power(on=True)
                 obj.sendReply("OK")
             elif data == "pause":
                 self._mpd.pause()
@@ -928,6 +945,7 @@ class IRApp(object):
                     obj.sendReply("")
             elif data in ("s", "stop"):
                 self._mpd.stop()
+                self._set_power(on=False)
                 obj.sendReply("OK")
             elif data in ("n", "next"):
                 self._mpd.next()
@@ -935,21 +953,25 @@ class IRApp(object):
             elif data in ("p", "prev", "previous"):
                 self._mpd.prev()
                 obj.sendReply("OK")
-            elif data in ("q", "quiet", "quiet-mode"):
-                self._watch.write("Q")
-                obj.sendReply("OK")
-            elif data in ("unlock",):
-                self._watch.write("U")
-                obj.sendReply("OK")
-            elif data in ("info",):
-                self._watch.write("i")
-            elif data in ("volume", "volume-info"):
-                self._watch.write("I")
-            elif data in ("louder", "L"):
-                self._watch.write("L")
-                obj.sendReply("OK")
-            else:
-                obj.sendReply("Failed")
+            else: # Arduino commands:
+                if not self._watch.is_open():
+                    obj.sendReply("Music volume control board is not connected/powered; Sorry :(")
+                    return # exit
+                elif data in ("q", "quiet", "quiet-mode"):
+                    self._watch.write("Q")
+                    obj.sendReply("OK")
+                elif data in ("unlock",):
+                    self._watch.write("U")
+                    obj.sendReply("OK")
+                elif data in ("info",):
+                    self._watch.write("i")
+                elif data in ("volume", "volume-info"):
+                    self._watch.write("I")
+                elif data in ("louder", "L"):
+                    self._watch.write("L")
+                    obj.sendReply("OK")
+                else:
+                    obj.sendReply("Failed")
 
     def _stdin_callback(self, pobj, fd, obj, event):
         logging.debug("Event %d on fd=%d" % (event, fd))
@@ -963,14 +985,17 @@ class IRApp(object):
                 self._connect()
             elif data == "play":
                 self._mpd.play()
+                self._set_power(on=True)
             elif data in ("current", "song", "current song", "now", "playing"):
                 st, song = self._mpd.currentSong()
                 if st:
                     logging.info("Current song: {0}".format(song))
             elif data in ("t", "toggle"):
                 self._mpd.togglePlay()
+                self._set_power(on=True)
             elif data in ("s", "stop"):
                 self._mpd.stop()
+                self._set_power(on=False)
             elif data in ("n", "next"):
                 self._mpd.next()
             elif data in ("p", "prev", "previous"):
