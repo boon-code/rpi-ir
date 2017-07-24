@@ -36,9 +36,6 @@ termios.c_cc = 6
 _DEFAULT_LOG_FORMAT = "%(name)s : %(threadName)s : %(levelname)s \
 : %(message)s"
 
-logging.basicConfig(stream=sys.stderr, format=_DEFAULT_LOG_FORMAT,
-                    level=logging.INFO)
-
 libc = ctypes.cdll.LoadLibrary("libc.so.6")
 
 
@@ -1052,7 +1049,11 @@ def main():
                        , default = True
                        , action = "store_false"
                        )
+    parser.set_defaults(verbosity=logging.INFO)
     args = parser.parse_args()
+
+    logging.basicConfig(stream=sys.stderr, format=_DEFAULT_LOG_FORMAT,
+                        level=args.verbosity)
 
     music_bot = None
     DEV='/dev/ttyIRUSB'
