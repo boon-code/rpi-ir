@@ -800,7 +800,7 @@ class IRBotPlugin(object):
 class IRApp(object):
     _DEBOUNCE_NS = 400000000
 
-    def __init__(self, path='/dev/ttyIRUSB'):
+    def __init__(self, path='/dev/ttyIRUSB', use_stdin=True):
         self._dev_path = path
         self._exit_cmd = ""
         self._poll = PollService()
@@ -808,9 +808,10 @@ class IRApp(object):
         self._watch = IRWatchFD(self._poll, path)
         self._watch.set_close_cb(self._disconnect)
         self._watch.set_event_cb(self._watch_callback)
-        stream_to_nonblocking(sys.stdin)
-        self._poll.add(sys.stdin, self._stdin_callback,
-                       PollService.READER_EMASK)
+        if use_stdin:
+            stream_to_nonblocking(sys.stdin)
+            self._poll.add(sys.stdin, self._stdin_callback,
+                           PollService.READER_EMASK)
         # Bot
         self.botif = IRBotPlugin()
         self._poll.add(self.botif, self._bot_callback,
@@ -1050,6 +1051,11 @@ def main():
                        , default = True
                        , action = "store_false"
                        )
+    parser.add_argument( '--no-stdin'
+                       , dest = 'use_stdin'
+                       , action = "store_false"
+                       , default = True
+                       )
     parser.set_defaults(verbosity=logging.INFO)
     args = parser.parse_args()
 
@@ -1058,7 +1064,7 @@ def main():
 
     music_bot = None
     DEV='/dev/ttyIRUSB'
-    dut = IRApp(DEV)
+    dut = IRApp(DEV, args.use_stdin)
     if args.bot_cfg is not None:
         try:
             music_bot = MusicBot( args.bot_cfg
