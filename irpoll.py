@@ -311,19 +311,19 @@ class TTYUnit(object):
 
     def read(self, max=1000):
         try:
-            return os.read(self._fd, max)
+            return os.read(self._fd, max).decode("ascii")
         except os.error:
             return ""
 
     def write(self, data):
         self._set_block_mode(True)
         try:
-            return os.write(self._fd, data)
+            return os.write(self._fd, data.encode("ascii"))
         finally:
             self._restore_block_mode()
 
     def write_nb(self, data):
-        return os.write(self._fd, data)
+        return os.write(self._fd, data.encode("ascii"))
 
     def close(self):
         if self._fd != -1:
@@ -369,7 +369,7 @@ class IRWatchFD(TTYUnit):
     def _actual_write(self):
         wbuf_size = len(self._wbuf)
         if wbuf_size > 0:
-            ret = os.write(self._fd, self._wbuf)
+            ret = os.write(self._fd, self._wbuf.encode('ascii'))
             if ret > 0:
                 self._wbuf = self._wbuf[ret:wbuf_size]
         else:
@@ -435,6 +435,7 @@ class MPDInterface(object):
             output = ""
             try:
                 output = subprocess.check_output(cmd)
+                output = output.decode('utf-8')
             except subprocess.CalledProcessError as e:
                 ret = e.returncode
             logging.debug("Call: '{0}': ret={1}".format(cmd_str, ret))
