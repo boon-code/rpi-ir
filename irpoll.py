@@ -216,7 +216,7 @@ class PollService(object):
             event_mask = self.DEFAULT_EMASK
         fd = self._get_fd(obj_or_fd)
         with self._lock:
-            if self._entries.has_key(fd):
+            if fd in self._entries:
                 raise AlreadyAssignedError()
             self._entries[fd] = PollEntry(callback,
                                           event_mask,
@@ -228,7 +228,7 @@ class PollService(object):
     def modify(self, obj_or_fd, callback=None, event_mask=None):
         fd = self._get_fd(obj_or_fd)
         with self._lock:
-            if self._entries.has_key(fd):
+            if fd in self._entries:
                 entry = self._entries[fd]
                 if callback is not None:
                     entry.callback = callback
@@ -246,7 +246,7 @@ class PollService(object):
     def remove(self, obj_or_fd):
         fd = self._get_fd(obj_or_fd)
         with self._lock:
-            if self._entries.has_key(fd):
+            if fd in self._entries:
                 self._ep.unregister(fd)
                 del self._entries[fd]
 
@@ -256,7 +256,7 @@ class PollService(object):
         for fd, event in self._ep.poll(timeout=timeout,
                                        maxevents=maxevents):
             with self._lock:
-                assert self._entries.has_key(fd), "only valid fd's"
+                assert fd in self._entries, "only valid fd's"
                 cb = self._entries[fd].callback
                 obj = self._entries[fd].obj
             cb(self, fd, obj, event)
