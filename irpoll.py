@@ -424,6 +424,7 @@ class MPDInterface(object):
             self._dummy_mode = True
 
     def _mpc(self, cmd):
+        ret = 0
         cmd = list(cmd)
         cmd.insert(0, self._bin)
         cmd_str = " ".join(cmd)
@@ -431,7 +432,6 @@ class MPDInterface(object):
             logging.info("Dummy mode command: [{0}]".format(cmd_str))
             return ret, ''
         else:
-            ret = 0
             output = ""
             try:
                 output = subprocess.check_output(cmd)
@@ -742,7 +742,7 @@ class MusicBot(threading.Thread):
                 self._sendTextMessage(cid, "No song is currently playing")
             else:
                 t = "Current song: {}".format(repl)
-            self._sendTextMessage(cid, t)
+                self._sendTextMessage(cid, t)
 
     def run(self, *args, **kwargs):
         last_update_id = 0
