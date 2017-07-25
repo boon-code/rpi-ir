@@ -19,6 +19,7 @@ import ctypes
 import termios
 import optparse
 import subprocess
+from math import log
 
 try:
     import queue
@@ -415,8 +416,23 @@ class IRWatchFD(TTYUnit):
             self._poll.remove(self)
         TTYUnit.close(self)
 
+
+class MPDEvent(object):
+    def __init__(self, proc):
+        self._proc = proc
+
+    def fileno(self):
+        return self._proc.stdout.fileno()
+
+    def getLine(self):
+        line = self._proc.stdout.readline().decode('utf-8')
+        return line.rstrip('\n')
+
+
 class MPDInterface(object):
     RE_STAT = re.compile(r'^[[](paused|playing)[]]', re.MULTILINE)
+    RE_VOL = re.compile(r'^volume:\s*(\d+)%', re.MULTILINE)
+
     def __init__(self, path="/usr/bin/mpc"):
         self._bin = path
         self._dummy_mode = False
@@ -452,8 +468,19 @@ class MPDInterface(object):
         else:
             return 'unkown'
 
+    def idleloop(self):
+        proc = subprocess.Popen([self._bin, 'idleloop'], stdout=subprocess.PIPE)
+        return MPDEvent(proc)
+
     def _mpc_call(self, *args):
         return self._mpc(args)
+
+    def volume(self):
+        ret, out = self._mpc_call("status", '--format=""')
+        if ret == 0:
+            m = self.RE_VOL.search(out)
+            if m is not None:
+                return int(m.group(1))
 
     def currentSong(self):
         ret, out = self._mpc_call("current")
@@ -800,7 +827,7 @@ class IRBotPlugin(object):
 class IRApp(object):
     _DEBOUNCE_NS = 400000000
 
-    def __init__(self, path='/dev/ttyIRUSB', use_stdin=True):
+    def __init__(self, path='/dev/ttyIRUSB', use_stdin=True, auto_volume=True):
         self._dev_path = path
         self._exit_cmd = ""
         self._poll = PollService()
@@ -811,6 +838,10 @@ class IRApp(object):
         if use_stdin:
             stream_to_nonblocking(sys.stdin)
             self._poll.add(sys.stdin, self._stdin_callback,
+                           PollService.READER_EMASK)
+        if auto_volume:
+            self.mpdevents = self._mpd.idleloop()
+            self._poll.add(self.mpdevents, self._mpd_event_callback,
                            PollService.READER_EMASK)
         # Bot
         self.botif = IRBotPlugin()
@@ -867,6 +898,13 @@ class IRApp(object):
                 self._watch.write('p')
         else:
             logging.debug("Arduino not connected")
+
+    def _set_volume(self, percent):
+        if (percent is None) or (percent > 100) or (percent < 0):
+            logging.error("Invalid volume (%): {}".format(percent))
+            return
+        dB = int(192 + 10 * (log((percent + 1) / 101.0) / log(2)))
+        self._watch.write('v{}V'.format(dB))
 
     def _watch_callback(self, t, ev):
         if t == "IR":
@@ -971,6 +1009,16 @@ class IRApp(object):
                     obj.sendReply("OK")
                 else:
                     obj.sendReply("Failed")
+
+    def _mpd_event_callback(self, pobj, fd, obj, event):
+        logging.debug("MPDEvent %d on fd=%d" % (event, fd))
+        if event & select.EPOLLIN:
+            data = obj.getLine()
+            logging.debug("Got event: {}".format(data))
+            if data == 'mixer':
+                vol = self._mpd.volume()
+                logging.debug("Current volume: {}".format(vol))
+                self._set_volume(vol)
 
     def _stdin_callback(self, pobj, fd, obj, event):
         logging.debug("Event %d on fd=%d" % (event, fd))
