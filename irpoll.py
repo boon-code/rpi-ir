@@ -468,6 +468,9 @@ class MPDInterface(object):
         else:
             return 'unkown'
 
+    def status(self):
+        return self._mpc_status()
+
     def idleloop(self):
         proc = subprocess.Popen([self._bin, 'idleloop'], stdout=subprocess.PIPE)
         return MPDEvent(proc)
@@ -1019,6 +1022,13 @@ class IRApp(object):
                 vol = self._mpd.volume()
                 logging.debug("Current volume: {}".format(vol))
                 self._set_volume(vol)
+            elif data == 'player':
+                cur_stat = self._mpd.status()
+                logging.debug("Current status: {}".format(cur_stat))
+                if cur_stat == 'stopped':
+                    self._set_power(on=False)
+                elif cur_stat == 'playing':
+                    self._set_power(on=True)
 
     def _stdin_callback(self, pobj, fd, obj, event):
         logging.debug("Event %d on fd=%d" % (event, fd))
